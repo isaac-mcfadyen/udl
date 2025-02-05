@@ -1,134 +1,139 @@
+import { Context, Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
+
 type Env = {
 	BUCKET: R2Bucket;
 	AUTH_KEY: string;
 };
 
-const checkMethod = (req: Request, method: string) => {
-	if (req.method !== method) {
-		throw new Response('Method not allowed', { status: 405 });
+const getQueryString = (c: Context, name: string): string => {
+	const val = c.req.query(name);
+	if (val == null) {
+		throw new HTTPException(400, { message: `Missing ${name}` });
 	}
+	return val;
 };
-const getUrlParam = (req: Request, name: string): string => {
-	const url = new URL(req.url);
-	const value = url.searchParams.get(name);
-	if (typeof value !== 'string') {
-		throw new Response(`Invalid or missing ${name}`, { status: 400 });
-	}
-	return value;
-};
-const getUrlParamNumber = (req: Request, name: string): number => {
-	const value = getUrlParam(req, name);
-	const n = parseInt(value, 10);
+const getQueryNumber = (c: Context, name: string): number => {
+	const val = getQueryString(c, name);
+	const n = parseInt(val, 10);
 	if (isNaN(n)) {
-		throw new Response(`Invalid ${name}`, { status: 400 });
+		throw new HTTPException(400, { message: `Invalid ${name}` });
+	}
+	return n;
+};
+const getPathString = (c: Context, name: string): string => {
+	const val = c.req.param(name);
+	if (val == null) {
+		throw new HTTPException(400, { message: `Missing ${name}` });
+	}
+	return val;
+};
+const getPathNumber = (c: Context, name: string): number => {
+	const val = getPathString(c, name);
+	const n = parseInt(val, 10);
+	if (isNaN(n)) {
+		throw new HTTPException(400, { message: `Invalid ${name}` });
 	}
 	return n;
 };
 
-const handleRequest = async (request: Request, env: Env) => {
-	const auth = request.headers.get('Authorization');
-	if (typeof auth !== 'string' || auth !== env.AUTH_KEY) {
-		throw Response.json({ error: 'Unauthorized' }, { status: 401 });
+const app = new Hono<{ Bindings: Env }>();
+app.onError((err, c) => {
+	console.error(err);
+	if (err instanceof HTTPException) {
+		return c.json({ error: err.message }, { status: err.status });
 	}
-
-	const url = new URL(request.url);
-	const firstPath = url.pathname.split('/').at(1);
-	if (firstPath == null) {
-		throw Response.json({ error: 'Not found' }, { status: 404 });
+	return c.json({ error: 'Internal Server Error' }, { status: 500 });
+});
+app.use(async (c, next) => {
+	if (c.env.BUCKET == null) {
+		return Response.json({ error: 'Missing BUCKET binding' }, { status: 500 });
 	}
-
-	switch (firstPath) {
-		case 'start-upload': {
-			checkMethod(request, 'POST');
-
-			const key = getUrlParam(request, 'key');
-			const mpu = await env.BUCKET.createMultipartUpload(key);
-			return Response.json({
-				key: mpu.key,
-				uploadId: mpu.uploadId,
-			});
-		}
-		case 'upload-part': {
-			checkMethod(request, 'POST');
-			if (request.body == null) {
-				throw Response.json({ error: 'No body' }, { status: 400 });
-			}
-
-			const key = getUrlParam(request, 'key');
-			const uploadId = getUrlParam(request, 'uploadId');
-			const partNumber = getUrlParamNumber(request, 'partNumber');
-			const mpu = env.BUCKET.resumeMultipartUpload(key, uploadId);
-			const part = await mpu.uploadPart(partNumber, request.body);
-			return Response.json({
-				partNumber: part.partNumber,
-				etag: part.etag,
-			});
-		}
-		case 'complete-upload': {
-			checkMethod(request, 'POST');
-
-			const key = getUrlParam(request, 'key');
-			const uploadId = getUrlParam(request, 'uploadId');
-
-			// Validate body.
-			const parts = await request.json();
-			if (!Array.isArray(parts)) {
-				return Response.json({ error: 'Invalid parts' }, { status: 400 });
-			}
-			if (!parts.every((part) => typeof part.partNumber === 'number' && typeof part.etag === 'string')) {
-				return Response.json({ error: 'Invalid parts' }, { status: 400 });
-			}
-			if (parts.length === 0) {
-				return Response.json({ error: 'No parts' }, { status: 400 });
-			}
-
-			const mpu = env.BUCKET.resumeMultipartUpload(key, uploadId);
-			await mpu.complete(parts);
-			return Response.json({ key });
-		}
-		case 'download': {
-			checkMethod(request, 'GET');
-			const key = getUrlParam(request, 'key');
-
-			const object = await env.BUCKET.get(key);
-			if (object == null) {
-				return Response.json({ error: 'Not found' }, { status: 404 });
-			}
-
-			const h = new Headers();
-			object.writeHttpMetadata(h);
-			return new Response(object.body, {
-				headers: h,
-			});
-		}
-		case 'stats': {
-			checkMethod(request, 'GET');
-			const key = getUrlParam(request, 'key');
-			const object = await env.BUCKET.head(key);
-			if (object == null) {
-				return Response.json({ error: 'Not found' }, { status: 404 });
-			}
-			return Response.json({
-				size: object.size,
-				etag: object.etag,
-			});
-		}
-		default: {
-			throw Response.json({ error: 'Not found' }, { status: 404 });
-		}
+	if (c.env.AUTH_KEY == null) {
+		return Response.json({ error: 'Missing AUTH_KEY secret' }, { status: 500 });
 	}
-};
+	return next();
+});
+app.post('/uploads/create', async (c) => {
+	const key = getQueryString(c, 'key');
+	const mpu = await c.env.BUCKET.createMultipartUpload(key);
+	return c.json({
+		key: mpu.key,
+		uploadId: mpu.uploadId,
+	});
+});
+app.post('/uploads/upload-part', async (c) => {
+	if (c.req.raw.body == null) {
+		throw new HTTPException(400, { message: 'No body' });
+	}
+	const key = getQueryString(c, 'key');
+	const uploadId = getQueryString(c, 'uploadId');
+	const partNumber = getQueryNumber(c, 'partNumber');
+	const mpu = c.env.BUCKET.resumeMultipartUpload(key, uploadId);
+	const part = await mpu.uploadPart(partNumber, c.req.raw.body);
+	return c.json({
+		partNumber: part.partNumber,
+		etag: part.etag,
+	});
+});
+app.post('/uploads/complete', async (c) => {
+	const key = getQueryString(c, 'key');
+	const uploadId = getQueryString(c, 'uploadId');
+	const parts = await c.req.json();
+	if (!Array.isArray(parts)) {
+		throw new HTTPException(400, { message: 'Invalid parts' });
+	}
+	if (!parts.every((part) => typeof part.partNumber === 'number' && typeof part.etag === 'string')) {
+		throw new HTTPException(400, { message: 'Invalid parts' });
+	}
+	if (parts.length === 0) {
+		throw new HTTPException(400, { message: 'No parts' });
+	}
+	const mpu = c.env.BUCKET.resumeMultipartUpload(key, uploadId);
+	await mpu.complete(parts);
+	return c.json({ key });
+});
 
-export default {
-	async fetch(request, env, ctx): Promise<Response> {
-		try {
-			return await handleRequest(request, env);
-		} catch (e) {
-			if (e instanceof Response) {
-				return e;
-			}
-			console.error(e);
-			return Response.json({ error: 'Internal server error' }, { status: 500 });
-		}
-	},
-} satisfies ExportedHandler<Env>;
+app.get('/objects', async (c) => {
+	const prefix = c.req.query('prefix');
+	const listed = await c.env.BUCKET.list({
+		prefix,
+		limit: 1000,
+	});
+	const objects = listed.objects.map((v) => ({
+		key: v.key,
+		size: v.size,
+		etag: v.etag,
+	}));
+	return c.json(objects);
+});
+app.get('/objects/:key', async (c) => {
+	const key = getPathString(c, 'key');
+	const object = await c.env.BUCKET.get(key);
+	if (object == null) {
+		throw new HTTPException(404, { message: 'Not found' });
+	}
+	const h = new Headers();
+	object.writeHttpMetadata(h);
+	return new Response(object.body, {
+		headers: h,
+	});
+});
+app.get('/objects/:key/stats', async (c) => {
+	const key = getPathString(c, 'key');
+	const object = await c.env.BUCKET.head(key);
+	if (object == null) {
+		throw new HTTPException(404, { message: 'Not found' });
+	}
+	return c.json({
+		size: object.size,
+		etag: object.etag,
+	});
+});
+app.delete('/objects/:key', async (c) => {
+	const key = getPathString(c, 'key');
+	await c.env.BUCKET.delete(key);
+	return c.newResponse(null, { status: 204 });
+});
+
+export default app;

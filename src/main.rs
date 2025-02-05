@@ -1,3 +1,5 @@
+mod config;
+
 use std::{
 	fmt::Write,
 	io::SeekFrom,
@@ -6,6 +8,7 @@ use std::{
 };
 
 use clap::Parser;
+use config::Config;
 use eyre::bail;
 use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -15,6 +18,9 @@ use tokio::{
 	fs::File,
 	io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
+
+const BOLD_WHITE: &str = "\x1b[1;37m";
+const CLEAR_COLOR: &str = "\x1b[0m";
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -29,11 +35,11 @@ struct Args {
 struct GlobalArgs {
 	/// The URL of the worker.
 	#[clap(long)]
-	url: String,
+	url: Option<String>,
 
 	/// The authentication key.
 	#[clap(long)]
-	key: String,
+	key: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -43,6 +49,15 @@ enum Subcommand {
 
 	/// Download a file.
 	Download(DownloadArgs),
+
+	/// Delete a file.
+	Delete(DeleteArgs),
+
+	/// List files, optionally filtering by a prefix.
+	List(ListArgs),
+
+	/// Save configuration to avoid having to pass it in every time.
+	SaveConfig,
 }
 
 #[derive(Debug, Parser)]
@@ -65,6 +80,18 @@ struct DownloadArgs {
 	/// Whether to overwrite the file if it already exists.
 	#[clap(long)]
 	force: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DeleteArgs {
+	/// The name of the file to delete.
+	name: String,
+}
+
+#[derive(Debug, Parser)]
+struct ListArgs {
+	/// Optional prefix to filter by.
+	prefix: Option<String>,
 }
 
 /// Splits a number into ranges, each with a maximum size of `chunk_size`.
@@ -93,7 +120,15 @@ struct UploadPartResponse {
 	etag: String,
 }
 
-async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListResponse {
+	key: String,
+	size: u64,
+	etag: String,
+}
+
+async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result<()> {
 	// Make sure the target file exists.
 	let meta = match tokio::fs::metadata(&args.path).await {
 		Ok(v) => v,
@@ -110,11 +145,16 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 	let client = reqwest::Client::new();
 
 	// Check to see if this key already exists.
-	let stats_url = format!("{}/stats", global.url.trim_end_matches('/'));
+	let key_encoded = urlencoding::encode(&args.name);
+	let url = format!(
+		"{}/objects/{}/stats",
+		base_url.trim_end_matches('/'),
+		key_encoded
+	);
 	let stats = client
-		.get(&stats_url)
+		.get(&url)
 		.query(&[("key", &args.name)])
-		.header("Authorization", &global.key)
+		.header("Authorization", &key)
 		.send()
 		.await?;
 	if !args.force && stats.status() != StatusCode::NOT_FOUND {
@@ -125,11 +165,11 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 	}
 
 	// Start multipart upload.
-	let start_url = format!("{}/start-upload", global.url.trim_end_matches('/'));
+	let url = format!("{}/uploads/create", base_url.trim_end_matches('/'));
 	let mpu = client
-		.post(&start_url)
+		.post(&url)
 		.query(&[("key", &args.name)])
-		.header("Authorization", &global.key)
+		.header("Authorization", &key)
 		.send()
 		.await?
 		.error_for_status()?
@@ -149,7 +189,7 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 
 	let name = Arc::new(args.name.clone());
 	let upload_id = Arc::new(mpu.upload_id.clone());
-	let key = Arc::new(global.key.clone());
+	let key = Arc::new(key.clone());
 
 	let futures = FuturesUnordered::new();
 	let ranges = split_ranges(
@@ -169,7 +209,7 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 		let pb = pb.clone();
 
 		let client = client.clone();
-		let url = format!("{}/upload-part", global.url.trim_end_matches('/'));
+		let url = format!("{}/uploads/upload-part", base_url.trim_end_matches('/'));
 		futures.push(tokio::task::spawn(async move {
 			let res = client
 				.post(&url)
@@ -179,6 +219,7 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 					("partNumber", (i + 1).to_string().as_str()),
 				])
 				.header("Authorization", key.as_str())
+				.header("Content-Length", (range.1 - range.0).to_string().as_str())
 				.body(reqwest::Body::wrap_stream(
 					tokio_util::io::ReaderStream::new(f),
 				))
@@ -208,11 +249,11 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 	let parts = parts.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
 
 	// Complete multipart upload.
-	let url = format!("{}/complete-upload", global.url.trim_end_matches('/'));
+	let url = format!("{}/uploads/complete", base_url.trim_end_matches('/'));
 	let res = client
 		.post(&url)
 		.query(&[("key", &args.name), ("uploadId", &mpu.upload_id)])
-		.header("Authorization", &global.key)
+		.header("Authorization", key.as_str())
 		.json(&parts)
 		.send()
 		.await?
@@ -223,7 +264,7 @@ async fn upload(global: GlobalArgs, args: UploadArgs) -> eyre::Result<()> {
 
 	Ok(())
 }
-async fn download(global: GlobalArgs, args: DownloadArgs) -> eyre::Result<()> {
+async fn download(base_url: String, key: String, args: DownloadArgs) -> eyre::Result<()> {
 	// If the file already exists, we don't want to overwrite it.
 	if !args.force && tokio::fs::metadata(&args.path).await.is_ok() {
 		bail!(
@@ -235,12 +276,17 @@ async fn download(global: GlobalArgs, args: DownloadArgs) -> eyre::Result<()> {
 	// Open the file.
 	let mut file = File::create(&args.path).await?;
 
-	let url = format!("{}/download", global.url.trim_end_matches('/'));
+	let key_encoded = urlencoding::encode(&args.name);
+	let url = format!(
+		"{}/objects/{}/download",
+		base_url.trim_end_matches('/'),
+		key_encoded
+	);
 	let client = reqwest::Client::new();
 	let res = client
 		.get(&url)
 		.query(&[("key", &args.name)])
-		.header("Authorization", &global.key)
+		.header("Authorization", &key)
 		.send()
 		.await?
 		.error_for_status()?;
@@ -270,6 +316,61 @@ async fn download(global: GlobalArgs, args: DownloadArgs) -> eyre::Result<()> {
 
 	Ok(())
 }
+async fn delete(base_url: String, key: String, args: DeleteArgs) -> eyre::Result<()> {
+	let key_encoded = urlencoding::encode(&args.name);
+	let url = format!(
+		"{}/objects/{}/stats",
+		base_url.trim_end_matches('/'),
+		key_encoded
+	);
+	let client = reqwest::Client::new();
+
+	// Make sure the file exists.
+	let res = client
+		.get(&url)
+		.header("Authorization", &key)
+		.send()
+		.await?;
+	if res.status() == StatusCode::NOT_FOUND {
+		bail!("The file {:?} does not exist", args.name);
+	}
+
+	// Delete the file.
+	let url = format!("{}/objects/{}", base_url.trim_end_matches('/'), key_encoded);
+	client
+		.delete(&url)
+		.header("Authorization", &key)
+		.send()
+		.await?
+		.error_for_status()?;
+	tracing::info!("Deleted {:?}", args.name);
+	Ok(())
+}
+async fn list(base_url: String, key: String, args: ListArgs) -> eyre::Result<()> {
+	let client = reqwest::Client::new();
+	let url = format!("{}/objects", base_url.trim_end_matches('/'));
+	let res = client
+		.get(&url)
+		.query(&[("prefix", args.prefix.as_deref())])
+		.header("Authorization", &key)
+		.send()
+		.await?
+		.error_for_status()?;
+	let res = res.json::<Vec<ListResponse>>().await?;
+	if res.is_empty() {
+		println!("{}No files found{}", BOLD_WHITE, CLEAR_COLOR);
+		return Ok(());
+	}
+
+	println!(
+		"{}{:<20} {:>10}{}",
+		BOLD_WHITE, "Key", "Size (KB)", CLEAR_COLOR
+	);
+	for item in res {
+		println!("{:<20} {:>10}", item.key, item.size / 1024);
+	}
+	Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -279,18 +380,55 @@ async fn main() {
 		.with_target(false)
 		.init();
 
-	const BOLD_WHITE: &str = "\x1b[1;37m";
-	const CLEAR_COLOR: &str = "\x1b[0m";
 	tracing::info!(
 		"{}Starting UDL {}{}",
 		BOLD_WHITE,
 		std::env!("CARGO_PKG_VERSION"),
 		CLEAR_COLOR
 	);
+
+	let Ok(mut config) = Config::new().await else {
+		tracing::error!("Failed to load config");
+		std::process::exit(1);
+	};
 	let args = Args::parse();
+
+	// Handle save config early.
+	if matches!(args.subcommand, Subcommand::SaveConfig) {
+		let (Some(url), Some(key)) = (args.global.url, args.global.key) else {
+			tracing::error!("Both --url and --key must be provided to save config");
+			std::process::exit(1);
+		};
+		if config.set_key(key).await.is_err() {
+			tracing::error!("Failed to save key");
+			std::process::exit(1);
+		}
+		if config.set_url(url).await.is_err() {
+			tracing::error!("Failed to save url");
+			std::process::exit(1);
+		}
+		tracing::info!("Saved config");
+		tracing::warn!("Note that credentials are saved in clear-text!");
+		std::process::exit(0);
+	}
+
+	let key = args.global.key.or(config.key());
+	let url = args.global.url.or(config.url());
+	let Some(key) = key else {
+		tracing::error!("No key saved or provided as --key flag");
+		std::process::exit(1);
+	};
+	let Some(url) = url else {
+		tracing::error!("No url saved or provided as --url flag");
+		std::process::exit(1);
+	};
+
 	let res = match args.subcommand {
-		Subcommand::Upload(v) => upload(args.global, v).await,
-		Subcommand::Download(v) => download(args.global, v).await,
+		Subcommand::Upload(v) => upload(url, key, v).await,
+		Subcommand::Download(v) => download(url, key, v).await,
+		Subcommand::Delete(v) => delete(url, key, v).await,
+		Subcommand::List(v) => list(url, key, v).await,
+		_ => unreachable!("Checked above"),
 	};
 	match res {
 		Ok(_) => {}

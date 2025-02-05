@@ -15,7 +15,7 @@ First, deploy the Worker.
 ```sh
 # Clone and install dependencies.
 git clone git@github.com:isaac-mcfadyen/udl.git && cd udl/worker && npm i
-# Modify the wrangler.json to add your own Worker name and zone, then...
+# Copy the wrangler.jsonc.example to wrangler.jsonc and add your own Worker name and zone, then...
 npm run deploy
 # Save the auth key, you'll need it later.
 npx wrangler secret put AUTH_KEY
