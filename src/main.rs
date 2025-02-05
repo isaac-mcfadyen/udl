@@ -5,12 +5,13 @@ use std::{
 	io::SeekFrom,
 	path::PathBuf,
 	sync::{atomic::AtomicI32, Arc},
+	time::Duration,
 };
 
 use clap::Parser;
 use config::Config;
 use eyre::bail;
-use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,7 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 			.unwrap()
 			.with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
 			.progress_chars("#>-"));
-	pb.tick();
+	pb.enable_steady_tick(Duration::from_millis(100));
 
 	let name = Arc::new(args.name.clone());
 	let upload_id = Arc::new(mpu.upload_id.clone());
@@ -211,7 +212,7 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 
 		let client = client.clone();
 		let url = format!("{}/uploads/upload-part", base_url.trim_end_matches('/'));
-		futures.push(tokio::task::spawn(async move {
+		futures.push(async move {
 			let res = client
 				.post(&url)
 				.query(&[
@@ -239,11 +240,11 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 
 			progress.fetch_add(
 				(range.1 - range.0) as i32,
-				std::sync::atomic::Ordering::Relaxed,
+				std::sync::atomic::Ordering::SeqCst,
 			);
-			pb.set_position(progress.load(std::sync::atomic::Ordering::Relaxed) as u64);
+			pb.set_position(progress.load(std::sync::atomic::Ordering::SeqCst) as u64);
 			Ok(part)
-		}));
+		});
 	}
 
 	// Run 5 uploads at once.
@@ -251,7 +252,7 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 		.buffer_unordered(5)
 		.collect::<Vec<_>>()
 		.await;
-	let parts = parts.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
+	let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
 
 	// Complete multipart upload.
 	let url = format!("{}/uploads/complete", base_url.trim_end_matches('/'));
@@ -305,7 +306,7 @@ async fn download(base_url: String, key: String, args: DownloadArgs) -> eyre::Re
         .unwrap()
         .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
         .progress_chars("#>-"));
-	pb.tick();
+	pb.enable_steady_tick(Duration::from_millis(100));
 
 	// Download the file.
 	let mut stream = res
