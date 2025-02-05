@@ -186,15 +186,16 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 			.unwrap()
 			.with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
 			.progress_chars("#>-"));
+	pb.tick();
 
 	let name = Arc::new(args.name.clone());
 	let upload_id = Arc::new(mpu.upload_id.clone());
 	let key = Arc::new(key.clone());
 
-	let futures = FuturesUnordered::new();
+	let mut futures = Vec::new();
 	let ranges = split_ranges(
-		meta.len(), // 50MB chunks.
-		50 * 1024 * 1024,
+		meta.len(), // 10MB chunks.
+		10 * 1024 * 1024,
 	);
 	for (i, range) in ranges.into_iter().enumerate() {
 		// Open and seek file.
@@ -245,7 +246,11 @@ async fn upload(base_url: String, key: String, args: UploadArgs) -> eyre::Result
 		}));
 	}
 
-	let parts = futures.collect::<Vec<_>>().await;
+	// Run 5 uploads at once.
+	let parts = futures::stream::iter(futures)
+		.buffer_unordered(5)
+		.collect::<Vec<_>>()
+		.await;
 	let parts = parts.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
 
 	// Complete multipart upload.
@@ -300,6 +305,7 @@ async fn download(base_url: String, key: String, args: DownloadArgs) -> eyre::Re
         .unwrap()
         .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
         .progress_chars("#>-"));
+	pb.tick();
 
 	// Download the file.
 	let mut stream = res
