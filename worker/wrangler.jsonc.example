@@ -1,0 +1,19 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "udl",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-01-29",
+	"observability": {
+		"enabled": true
+	},
+	"route": {
+		"zone_name": "example.com",
+		"pattern": "https://udl.example.com/*"
+	},
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "example-bucket"
+		}
+	]
+}
