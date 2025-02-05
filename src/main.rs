@@ -46,15 +46,19 @@ struct GlobalArgs {
 #[derive(Debug, Parser)]
 enum Subcommand {
 	/// Upload a file.
+	#[clap(alias = "put", alias = "up")]
 	Upload(UploadArgs),
 
 	/// Download a file.
+	#[clap(alias = "get", alias = "dl")]
 	Download(DownloadArgs),
 
 	/// Delete a file.
+	#[clap(alias = "del", alias = "rm")]
 	Delete(DeleteArgs),
 
 	/// List files, optionally filtering by a prefix.
+	#[clap(alias = "ls")]
 	List(ListArgs),
 
 	/// Save configuration to avoid having to pass it in every time.
